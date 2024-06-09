@@ -3,7 +3,7 @@ import datetime as dt
 import pandas as pd
 from typing import List, Tuple
 
-# Establishing connection
+# Establishing connection for prj
 
 # Load equity data from CSV
 
