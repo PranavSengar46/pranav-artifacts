@@ -1,0 +1,170 @@
+import streamlit as st
+import pandas as pd
+import requests
+import json
+import fitz  # PyMuPDF
+import zipfile
+from io import BytesIO
+from azure.storage.blob import BlobServiceClient
+
+# Function to call the Azure OpenAI API
+def chat_with_gpt(endpoint, api_key, prompt):
+    headers = {
+        "Content-Type": "application/json",
+        "api-key": api_key,
+    }
+
+    data = {
+        "model": "gpt-4o",  # Specify the model
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 800,  # Adjust token limit as needed
+    }
+
+    response = requests.post(f"{endpoint}", headers=headers, json=data)
+
+    if response.status_code == 200:
+        return response.json()["choices"][0]["message"]["content"]
+    else:
+        return f"Error: {response.status_code}, {response.text}"
+
+# Function to extract text from PDF
+def extract_text_from_pdf(uploaded_file):
+    doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+    text = ""
+    for page in doc:
+        text += page.get_text()
+    return text
+
+# Function to split text into chunks
+def split_text_into_chunks(text, max_length):
+    return [text[i:i + max_length] for i in range(0, len(text), max_length)]
+
+# Function to read data from Azure Blob Storage
+def read_blob_data(connection_string, container_name, blob_name):
+    blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+    blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
+    blob_data = blob_client.download_blob().readall()
+    return blob_data.decode('utf-8')
+
+# Function to extract Python code from text
+def extract_python_code(text):
+    code_blocks = []
+    lines = text.split('\n')
+    inside_code_block = False
+    code_block = []
+
+    for line in lines:
+        if line.strip().startswith('```python'):
+            inside_code_block = True
+            code_block = []
+        elif line.strip().startswith('```') and inside_code_block:
+            inside_code_block = False
+            code_blocks.append('\n'.join(code_block))
+        elif inside_code_block:
+            code_block.append(line)
+
+    return code_blocks
+
+# Function to execute Python code
+def execute_python_code(code):
+    st.write("**Executing Python Code:**")
+    st.code(code, language='python')
+    try:
+        exec(code, globals())
+    except Exception as e:
+        st.error(f"Error executing code: {e}")
+
+# Streamlit user interface
+st.title("ChatGPT-4o Azure Interface with File Upload")
+
+# Input fields for endpoint and API key
+endpoint = st.text_input("Azure OpenAI Endpoint", placeholder="https://.openai.azure.com/")
+api_key = st.text_input("API Key", type="password")
+
+# Checkbox for selecting file upload type
+upload_type = st.checkbox("Upload ZIP file containing PDFs")
+
+# File uploader based on the selected type
+if upload_type:
+    uploaded_file = st.file_uploader("Upload a ZIP file containing PDFs", type=["zip"])
+else:
+    uploaded_file = st.file_uploader("Upload a file (txt, csv, pdf)", type=["txt", "csv", "pdf"])
+
+# Input fields for Azure Blob Storage
+use_blob_storage = st.checkbox("Use Azure Blob Storage")
+if use_blob_storage:
+    connection_string = st.text_input("Azure Blob Storage Connection String")
+    container_name = st.text_input("Container Name")
+    blob_name = st.text_input("Blob Name")
+
+# Text input for user prompt
+user_prompt = st.text_area("Ask a question related to the uploaded file:")
+
+# Button to submit the prompt
+if st.button("Submit"):
+    if endpoint and api_key and user_prompt:
+        if use_blob_storage:
+            if connection_string and container_name and blob_name:
+                combined_content = read_blob_data(connection_string, container_name, blob_name)
+                file_type = "blob"
+            else:
+                st.warning("Please provide all Azure Blob Storage details.")
+                combined_content = ""
+        elif upload_type:
+            # Read the uploaded ZIP file
+            if uploaded_file and uploaded_file.type == "application/zip":
+                with zipfile.ZipFile(uploaded_file) as z:
+                    combined_content = ""
+                    for file_info in z.infolist():
+                        if file_info.filename.endswith(".pdf"):
+                            with z.open(file_info) as pdf_file:
+                                content = extract_text_from_pdf(pdf_file)
+                                combined_content += content + "\n"
+                    file_type = "pdf"
+            else:
+                st.warning("Currently, only ZIP files containing PDFs are processed.")
+                combined_content = ""
+        else:
+            # Read the uploaded file
+            if uploaded_file:
+                if uploaded_file.type == "text/plain":
+                    content = uploaded_file.read().decode("utf-8")
+                    file_type = "text"
+                elif uploaded_file.type == "text/csv":
+                    content = pd.read_csv(uploaded_file).to_string()  # Convert DataFrame to string
+                    file_type = "csv"
+                elif uploaded_file.type == "application/pdf":
+                    content = extract_text_from_pdf(uploaded_file)
+                    file_type = "pdf"
+                else:
+                    st.warning("Currently, only text, CSV, and PDF files are processed.")
+                    content = ""
+
+                combined_content = content
+            else:
+                st.warning("Please upload a file.")
+                combined_content = ""
+
+        if combined_content:
+            # Split content into chunks
+            max_length = 1048576  # Maximum length allowed by the API
+            chunks = split_text_into_chunks(combined_content, max_length)
+
+            # Process each chunk separately
+            responses = []
+            for chunk in chunks:
+                full_prompt = f"Here is the content of the {file_type} file:\n{chunk}\n\nUser's Question: {user_prompt}\n\in streamlit using matplot"
+                response = chat_with_gpt(endpoint, api_key, full_prompt)
+                responses.append(response)
+
+            # Combine responses
+            combined_response = "\n".join(responses)
+            st.write("**Response:**")
+            st.write(combined_response)
+
+            # Extract and execute Python code from the response
+            code_blocks = extract_python_code(combined_response)
+            for code in code_blocks:
+                execute_python_code(code)
+    else:
+        st.warning("Please fill all fields and upload a file.")
